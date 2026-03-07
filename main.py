@@ -4,7 +4,9 @@ import time
 import uuid
 import hashlib
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
+import json
+import base64
 
 app = Flask(__name__)
 CORS(app)
@@ -13,15 +15,18 @@ users = {}
 messages = defaultdict(list)
 sessions = {}
 last_active = {}
+user_keys = {}  
+pending_keys = {}  
 
 def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+    return hashlib.sha3_256(password.encode()).hexdigest()
 
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     username = data.get('username')
     password = data.get('password')
+    public_key = data.get('public_key')
     
     if not username or not password:
         return jsonify({"error": "Username and password required"}), 400
@@ -32,7 +37,8 @@ def register():
     users[username] = {
         "password": hash_password(password),
         "created_at": time.time(),
-        "last_seen": time.time()
+        "last_seen": time.time(),
+        "public_key": public_key
     }
     
     return jsonify({"status": "registered", "username": username}), 200
@@ -61,54 +67,65 @@ def login():
     return jsonify({
         "status": "logged_in",
         "token": token,
-        "username": username
+        "username": username,
+        "public_key": user.get("public_key")
     }), 200
 
-@app.route('/logout', methods=['POST'])
-def logout():
+@app.route('/key/exchange', methods=['POST'])
+def exchange_key():
     data = request.json
     token = data.get('token')
+    target_user = data.get('target_user')
+    encrypted_key = data.get('encrypted_key')
     
-    if token in sessions:
-        username = sessions[token]["username"]
-        del sessions[token]
-        if username in last_active:
-            del last_active[username]
-        return jsonify({"status": "logged_out"}), 200
+    if token not in sessions:
+        return jsonify({"error": "Invalid token"}), 401
     
-    return jsonify({"error": "Invalid token"}), 400
+    sender = sessions[token]["username"]
+    
+    if target_user not in users:
+        return jsonify({"error": "User not found"}), 404
+    
+    if target_user not in pending_keys:
+        pending_keys[target_user] = []
+    
+    pending_keys[target_user].append({
+        "from": sender,
+        "encrypted_key": encrypted_key,
+        "time": time.time(),
+        "id": str(uuid.uuid4())
+    })
+    
+    return jsonify({"status": "key_sent"}), 200
 
-@app.route('/online_users', methods=['GET'])
-def get_online_users():
+@app.route('/key/receive', methods=['GET'])
+def receive_key():
     token = request.args.get('token')
     
     if token not in sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    current_user = sessions[token]["username"]
-    now = time.time()
-    online = []
-    offline = []
+    username = sessions[token]["username"]
     
-    for username, user_data in users.items():
-        if username == current_user:
-            continue
-        
-        last_seen = user_data.get("last_seen", 0)
-        if now - last_seen < 60:
-            online.append({
-                "username": username,
-                "last_seen": "online"
-            })
-        else:
-            offline.append({
-                "username": username,
-                "last_seen": datetime.fromtimestamp(last_seen).strftime('%Y-%m-%d %H:%M')
-            })
+    keys = pending_keys.get(username, [])
+    pending_keys[username] = []
+    
+    return jsonify({"keys": keys}), 200
+
+@app.route('/key/get/<username>', methods=['GET'])
+def get_public_key(username):
+    token = request.args.get('token')
+    
+    if token not in sessions:
+        return jsonify({"error": "Invalid token"}), 401
+    
+    user = users.get(username)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
     
     return jsonify({
-        "online": online,
-        "offline": offline
+        "username": username,
+        "public_key": user.get("public_key")
     }), 200
 
 @app.route('/send', methods=['POST'])
@@ -116,7 +133,8 @@ def send_message():
     data = request.json
     token = data.get('token')
     recipient = data.get('recipient')
-    text = data.get('text')
+    encrypted_text = data.get('encrypted_text')
+    key_id = data.get('key_id')
     
     if token not in sessions:
         return jsonify({"error": "Invalid token"}), 401
@@ -128,7 +146,8 @@ def send_message():
     
     message = {
         "from": sender,
-        "text": text,
+        "encrypted_text": encrypted_text,
+        "key_id": key_id,
         "time": time.time(),
         "id": str(uuid.uuid4())
     }
@@ -136,8 +155,6 @@ def send_message():
     messages[recipient].append(message)
     last_active[sender] = time.time()
     users[sender]["last_seen"] = time.time()
-    
-    print(f"[{sender} -> {recipient}]: {text}")
     
     return jsonify({"status": "sent", "message_id": message["id"]}), 200
 
@@ -164,20 +181,36 @@ def receive_messages():
         "server_time": time.time()
     }), 200
 
-@app.route('/users', methods=['GET'])
-def get_users_list():
+@app.route('/online_users', methods=['GET'])
+def get_online_users():
     token = request.args.get('token')
     
     if token not in sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    return jsonify({
-        "users": list(users.keys())
-    }), 200
+    current_user = sessions[token]["username"]
+    now = time.time()
+    users_list = []
+    
+    for username, user_data in users.items():
+        if username == current_user:
+            continue
+        
+        last_seen = user_data.get("last_seen", 0)
+        is_online = now - last_seen < 60
+        
+        users_list.append({
+            "username": username,
+            "online": is_online,
+            "last_seen": last_seen,
+            "has_public_key": bool(user_data.get("public_key"))
+        })
+    
+    return jsonify({"users": users_list}), 200
 
 @app.route('/')
 def index():
-    return f"Messenger Server Running. Users: {len(users)}"
+    return "Secure Messenger Running"
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000)
