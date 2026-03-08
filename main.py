@@ -1,27 +1,43 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from supabase import create_client
 import time
 import uuid
 import hashlib
+import secrets
+import hmac
+from datetime import datetime, timedelta
 from collections import defaultdict
-from datetime import datetime
 import json
-import base64
+import os
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
 CORS(app)
 
-users = {}
-messages = defaultdict(list)
-sessions = {}
-last_active = {}
-user_keys = {}  
-pending_keys = {}  
+SUPABASE_URL = "https://kuhunkdgbtedgrujwxoy.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt1aHVua2RnYnRlZGdydWp3eG95Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQyOTMyODEsImV4cCI6MjA2OTg2OTI4MX0.N5I9bGTroqMDD9g0b-3lqMMip0NFRDTH30dh_hQ9kJY"
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+active_sessions = {}
+online_users = set()
+pending_keys = defaultdict(list)
 
 def hash_password(password):
     return hashlib.sha3_256(password.encode()).hexdigest()
 
-@app.route('/register', methods=['POST'])
+def generate_token():
+    return secrets.token_urlsafe(32)
+
+@app.route('/')
+def index():
+    return send_from_directory('static', 'index.html')
+
+@app.route('/<path:path>')
+def static_files(path):
+    return send_from_directory('static', path)
+
+@app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
     username = data.get('username')
@@ -31,186 +47,253 @@ def register():
     if not username or not password:
         return jsonify({"error": "Username and password required"}), 400
     
-    if username in users:
+    existing = supabase.table('users').select('*').eq('username', username).execute()
+    if existing.data:
         return jsonify({"error": "User already exists"}), 400
     
-    users[username] = {
-        "password": hash_password(password),
-        "created_at": time.time(),
-        "last_seen": time.time(),
-        "public_key": public_key
+    user = {
+        'username': username,
+        'password': hash_password(password),
+        'public_key': public_key,
+        'created_at': time.time(),
+        'last_seen': time.time()
     }
     
-    return jsonify({"status": "registered", "username": username}), 200
+    supabase.table('users').insert(user).execute()
+    return jsonify({"status": "registered"}), 200
 
-@app.route('/login', methods=['POST'])
+@app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
     username = data.get('username')
     password = data.get('password')
     
-    if not username or not password:
-        return jsonify({"error": "Username and password required"}), 400
-    
-    user = users.get(username)
-    if not user or user["password"] != hash_password(password):
+    result = supabase.table('users').select('*').eq('username', username).execute()
+    if not result.data:
         return jsonify({"error": "Invalid credentials"}), 401
     
-    token = str(uuid.uuid4())
-    sessions[token] = {
-        "username": username,
-        "login_time": time.time()
+    user = result.data[0]
+    if user['password'] != hash_password(password):
+        return jsonify({"error": "Invalid credentials"}), 401
+    
+    token = generate_token()
+    active_sessions[token] = {
+        'username': username,
+        'login_time': time.time()
     }
-    last_active[username] = time.time()
-    user["last_seen"] = time.time()
+    online_users.add(username)
+    
+    supabase.table('users').update({'last_seen': time.time()}).eq('username', username).execute()
     
     return jsonify({
         "status": "logged_in",
         "token": token,
         "username": username,
-        "public_key": user.get("public_key")
+        "public_key": user.get('public_key')
     }), 200
 
-@app.route('/key/exchange', methods=['POST'])
-def exchange_key():
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    data = request.json
+    token = data.get('token')
+    
+    if token in active_sessions:
+        username = active_sessions[token]['username']
+        online_users.discard(username)
+        del active_sessions[token]
+    
+    return jsonify({"status": "logged_out"}), 200
+
+@app.route('/api/key/exchange', methods=['POST'])
+def key_exchange():
     data = request.json
     token = data.get('token')
     target_user = data.get('target_user')
-    encrypted_key = data.get('encrypted_key')
+    public_key = data.get('public_key')
+    key_id = data.get('key_id')
     
-    if token not in sessions:
+    if token not in active_sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    sender = sessions[token]["username"]
+    sender = active_sessions[token]['username']
     
-    if target_user not in users:
+    result = supabase.table('users').select('*').eq('username', target_user).execute()
+    if not result.data:
         return jsonify({"error": "User not found"}), 404
-    
-    if target_user not in pending_keys:
-        pending_keys[target_user] = []
     
     pending_keys[target_user].append({
         "from": sender,
-        "encrypted_key": encrypted_key,
-        "time": time.time(),
-        "id": str(uuid.uuid4())
+        "public_key": public_key,
+        "key_id": key_id,
+        "time": time.time()
     })
     
-    return jsonify({"status": "key_sent"}), 200
+    return jsonify({"status": "sent"}), 200
 
-@app.route('/key/receive', methods=['GET'])
-def receive_key():
+@app.route('/api/key/receive', methods=['GET'])
+def key_receive():
     token = request.args.get('token')
     
-    if token not in sessions:
+    if token not in active_sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    username = sessions[token]["username"]
-    
+    username = active_sessions[token]['username']
     keys = pending_keys.get(username, [])
     pending_keys[username] = []
     
     return jsonify({"keys": keys}), 200
 
-@app.route('/key/get/<username>', methods=['GET'])
+@app.route('/api/key/get/<username>', methods=['GET'])
 def get_public_key(username):
     token = request.args.get('token')
     
-    if token not in sessions:
+    if token not in active_sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    user = users.get(username)
-    if not user:
+    result = supabase.table('users').select('public_key').eq('username', username).execute()
+    if not result.data:
         return jsonify({"error": "User not found"}), 404
     
     return jsonify({
         "username": username,
-        "public_key": user.get("public_key")
+        "public_key": result.data[0].get('public_key')
     }), 200
 
-@app.route('/send', methods=['POST'])
+@app.route('/api/send', methods=['POST'])
 def send_message():
     data = request.json
     token = data.get('token')
     recipient = data.get('recipient')
     encrypted_text = data.get('encrypted_text')
     key_id = data.get('key_id')
+    nonce = data.get('nonce')
+    msg_id = data.get('msg_id', str(uuid.uuid4()))
     
-    if token not in sessions:
+    if token not in active_sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    sender = sessions[token]["username"]
+    sender = active_sessions[token]['username']
     
-    if recipient not in users:
+    result = supabase.table('users').select('*').eq('username', recipient).execute()
+    if not result.data:
         return jsonify({"error": "Recipient not found"}), 404
     
     message = {
-        "from": sender,
-        "encrypted_text": encrypted_text,
-        "key_id": key_id,
-        "time": time.time(),
-        "id": str(uuid.uuid4())
+        'from': sender,
+        'to': recipient,
+        'encrypted_text': encrypted_text,
+        'key_id': key_id,
+        'nonce': nonce,
+        'time': time.time(),
+        'id': msg_id,
+        'delivered': False
     }
     
-    messages[recipient].append(message)
-    last_active[sender] = time.time()
-    users[sender]["last_seen"] = time.time()
+    supabase.table('messages').insert(message).execute()
     
-    return jsonify({"status": "sent", "message_id": message["id"]}), 200
+    return jsonify({"status": "sent", "message_id": msg_id}), 200
 
-@app.route('/receive', methods=['GET'])
+@app.route('/api/receive', methods=['GET'])
 def receive_messages():
     token = request.args.get('token')
     since = float(request.args.get('since', 0))
     
-    if token not in sessions:
+    if token not in active_sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    username = sessions[token]["username"]
-    last_active[username] = time.time()
-    users[username]["last_seen"] = time.time()
+    username = active_sessions[token]['username']
     
-    new_messages = [
-        msg for msg in messages[username] 
-        if msg['time'] > since
-    ]
+    supabase.table('users').update({'last_seen': time.time()}).eq('username', username).execute()
+    online_users.add(username)
+    
+    result = supabase.table('messages')\
+        .select('*')\
+        .eq('to', username)\
+        .gt('time', since)\
+        .order('time', desc=False)\
+        .execute()
+    
+    messages = result.data if result.data else []
     
     return jsonify({
-        "messages": new_messages,
-        "count": len(new_messages),
+        "messages": messages,
+        "count": len(messages),
         "server_time": time.time()
     }), 200
 
-@app.route('/online_users', methods=['GET'])
+@app.route('/api/online_users', methods=['GET'])
 def get_online_users():
     token = request.args.get('token')
     
-    if token not in sessions:
+    if token not in active_sessions:
         return jsonify({"error": "Invalid token"}), 401
     
-    current_user = sessions[token]["username"]
     now = time.time()
-    users_list = []
+    result = supabase.table('users').select('username, last_seen').execute()
     
-    for username, user_data in users.items():
-        if username == current_user:
+    users_list = []
+    for user in result.data if result.data else []:
+        if user['username'] == active_sessions[token]['username']:
             continue
         
-        last_seen = user_data.get("last_seen", 0)
-        is_online = now - last_seen < 60
+        last_seen = user.get('last_seen', 0)
+        is_online = user['username'] in online_users or (now - last_seen < 60)
         
         users_list.append({
-            "username": username,
+            "username": user['username'],
             "online": is_online,
-            "last_seen": last_seen,
-            "has_public_key": bool(user_data.get("public_key"))
+            "last_seen": last_seen
         })
     
     return jsonify({"users": users_list}), 200
 
-@app.route('/')
-def index():
-    return "Secure Messenger Running"
+@app.route('/api/history/<username>', methods=['GET'])
+def get_history(username):
+    token = request.args.get('token')
+    limit = int(request.args.get('limit', 50))
+    
+    if token not in active_sessions:
+        return jsonify({"error": "Invalid token"}), 401
+    
+    current_user = active_sessions[token]['username']
+    
+    result = supabase.table('messages')\
+        .select('*')\
+        .or_(
+            f'and(from.eq.{current_user},to.eq.{username}),' +
+            f'and(from.eq.{username},to.eq.{current_user})'
+        )\
+        .order('time', desc=True)\
+        .limit(limit)\
+        .execute()
+    
+    messages = result.data if result.data else []
+    
+    return jsonify({"messages": messages}), 200
+
+@app.route('/api/status', methods=['POST'])
+def update_status():
+    data = request.json
+    token = data.get('token')
+    status = data.get('status')
+    
+    if token not in active_sessions:
+        return jsonify({"error": "Invalid token"}), 401
+    
+    username = active_sessions[token]['username']
+    
+    supabase.table('users').update({'status': status}).eq('username', username).execute()
+    
+    return jsonify({"status": "updated"}), 200
+
+@app.route('/api/health')
+def health():
+    return jsonify({
+        "status": "ok",
+        "time": time.time(),
+        "users": len(online_users),
+        "sessions": len(active_sessions)
+    }), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, threaded=True)
