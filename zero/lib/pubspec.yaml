@@ -1,0 +1,15 @@
+name: tic_tac_toe          # Название пакета (будет использовано в APK)
+description: Крестики-нолики против бота
+version: 1.0.0+1           # 1.0.0 - версия, +1 - build number
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_animate: ^4.5.0
+  confetti: ^0.7.0
+
+flutter:
+  uses-material-design: true
